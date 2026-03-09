@@ -5,170 +5,349 @@ import { log } from './log-util.js'
 // 请求工具方法
 // =====================
 
-export async function httpGet(url, options = {}) {
-
-  log("info", `[请求模拟] HTTP GET: ${url}`);
-
-  // 设置超时时间（默认5秒）
-  const timeout = parseInt(globals.vodRequestTimeout || '5000', 10) || 5000;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        ...options.headers,
-      },
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    let data;
-
-    if (options.base64Data) {
-      log("info", "base64模式");
-
-      // 先拿二进制
-      const arrayBuffer = await response.arrayBuffer();
-      const uint8Array = new Uint8Array(arrayBuffer);
-
-      // 转换为 Base64
-      let binary = '';
-      const chunkSize = 0x8000; // 分块防止大文件卡死
-      for (let i = 0; i < uint8Array.length; i += chunkSize) {
-        let chunk = uint8Array.subarray(i, i + chunkSize);
-        binary += String.fromCharCode.apply(null, chunk);
-      }
-      data = btoa(binary); // 得到 base64 字符串
-
-    } else if (options.zlibMode) {
-      log("info", "zlib模式")
-
-      // 获取 ArrayBuffer
-      const arrayBuffer = await response.arrayBuffer();
-
-      // 使用 DecompressionStream 进行解压
-      // "deflate" 对应 zlib 的 inflate
-      const decompressionStream = new DecompressionStream("deflate");
-      const decompressedStream = new Response(
-        new Blob([arrayBuffer]).stream().pipeThrough(decompressionStream)
-      );
-
-      // 读取解压后的文本
-      let decodedData;
-      try {
-        decodedData = await decompressedStream.text();
-      } catch (e) {
-        log("error", "[请求模拟] 解压缩失败", e);
-        throw e;
-      }
-
-      data = decodedData; // 更新解压后的数据
+/**
+ * 将外部中断信号链接到内部控制器
+ * @param {AbortSignal} externalSignal 外部传入的信号
+ * @param {AbortController} internalController 内部使用的控制器
+ */
+function linkSignal(externalSignal, internalController) {
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      internalController.abort();
     } else {
-      data = await response.text();
+      externalSignal.addEventListener('abort', () => {
+        internalController.abort();
+      }, { once: true });
     }
-
-    let parsedData;
-    try {
-      parsedData = JSON.parse(data);  // 尝试将文本解析为 JSON
-    } catch (e) {
-      parsedData = data;  // 如果解析失败，保留原始文本
-    }
-
-    // 获取所有 headers，但特别处理 set-cookie
-    const headers = {};
-    let setCookieValues = [];
-
-    // 遍历 headers 条目
-    for (const [key, value] of response.headers.entries()) {
-      if (key.toLowerCase() === 'set-cookie') {
-        setCookieValues.push(value);
-      } else {
-        headers[key] = value;
-      }
-    }
-
-    // 如果存在 set-cookie 头，将其合并为分号分隔的字符串
-    if (setCookieValues.length > 0) {
-      headers['set-cookie'] = setCookieValues.join(';');
-    }
-    // 模拟 iOS 环境：返回 { data: ... } 结构
-    return {
-      data: parsedData,
-      status: response.status,
-      headers: headers
-    };
-
-  } catch (error) {
-    clearTimeout(timeoutId);
-
-    // 检查是否是超时错误
-    if (error.name === 'AbortError') {
-      log("error", `[请求模拟] 请求超时:`, error.message);
-      log("error", '详细诊断:');
-      log("error", '- URL:', url);
-      log("error", '- 超时时间:', `${timeout}ms`);
-      throw new Error(`Request timeout after ${timeout}ms`);
-    }
-
-    log("error", `[请求模拟] 请求失败:`, error.message);
-    log("error", '详细诊断:');
-    log("error", '- URL:', url);
-    log("error", '- 错误类型:', error.name);
-    log("error", '- 消息:', error.message);
-    if (error.cause) {
-      log("error", '- 码:', error.cause.code);  // e.g., 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'
-      log("error", '- 原因:', error.cause.message);
-    }
-    throw error;
   }
 }
 
-export async function httpPost(url, body, options = {}) {
-  log("info", `[请求模拟] HTTP POST: ${url}`);
+export async function httpGet(url, options = {}) {
+  // 从 options 中获取重试次数，默认为 0
+  const maxRetries = parseInt(options.retries || '0', 10) || 0;
+  let lastError;
 
-  // 处理请求头、body 和其他参数
+  // 执行请求，包含重试逻辑
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      log("info", `[请求模拟] 第 ${attempt} 次重试: ${url}`);
+      // 可选：添加重试延迟（指数退避）
+      await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt - 1), 5000)));
+    } else {
+      log("info", `[请求模拟] HTTP GET: ${url}`);
+    }
+
+    // 设置超时时间（默认5秒）
+    const timeout = parseInt(globals.vodRequestTimeout || '5000', 10) || 5000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    // 链接外部中断信号
+    linkSignal(options.signal, controller);
+
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          ...options.headers,
+        },
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      let data;
+
+      if (options.base64Data) {
+        log("info", "base64模式");
+
+        // 先拿二进制
+        const arrayBuffer = await response.arrayBuffer();
+        const uint8Array = new Uint8Array(arrayBuffer);
+
+        // 转换为 Base64
+        let binary = '';
+        const chunkSize = 0x8000; // 分块防止大文件卡死
+        for (let i = 0; i < uint8Array.length; i += chunkSize) {
+          let chunk = uint8Array.subarray(i, i + chunkSize);
+          binary += String.fromCharCode.apply(null, chunk);
+        }
+        data = btoa(binary); // 得到 base64 字符串
+
+      } else if (options.zlibMode) {
+        log("info", "zlib模式")
+
+        // 获取 ArrayBuffer
+        const arrayBuffer = await response.arrayBuffer();
+
+        // 使用 DecompressionStream 进行解压
+        // "deflate" 对应 zlib 的 inflate
+        const decompressionStream = new DecompressionStream("deflate");
+        const decompressedStream = new Response(
+          new Blob([arrayBuffer]).stream().pipeThrough(decompressionStream)
+        );
+
+        // 读取解压后的文本
+        let decodedData;
+        try {
+          decodedData = await decompressedStream.text();
+        } catch (e) {
+          log("error", "[请求模拟] 解压缩失败", e);
+          throw e;
+        }
+
+        data = decodedData; // 更新解压后的数据
+      } else {
+        data = await response.text();
+      }
+
+      let parsedData;
+      try {
+        parsedData = JSON.parse(data);  // 尝试将文本解析为 JSON
+      } catch (e) {
+        parsedData = data;  // 如果解析失败，保留原始文本
+      }
+
+      // 获取所有 headers，但特别处理 set-cookie
+      const headers = {};
+      let setCookieValues = [];
+
+      // 遍历 headers 条目
+      for (const [key, value] of response.headers.entries()) {
+        if (key.toLowerCase() === 'set-cookie') {
+          setCookieValues.push(value);
+        } else {
+          headers[key] = value;
+        }
+      }
+
+      // 如果存在 set-cookie 头，将其合并为分号分隔的字符串
+      if (setCookieValues.length > 0) {
+        headers['set-cookie'] = setCookieValues.join(';');
+      }
+
+      // 请求成功，返回结果
+      if (attempt > 0) {
+        log("info", `[请求模拟] 重试成功`);
+      }
+
+      // 模拟 iOS 环境：返回 { data: ... } 结构
+      return {
+        data: parsedData,
+        status: response.status,
+        headers: headers
+      };
+
+    } catch (error) {
+      clearTimeout(timeoutId);
+      lastError = error;
+
+      // 如果是外部信号导致的中断，停止重试并直接抛出
+      if (options.signal?.aborted) {
+        throw error;
+      }
+
+      // 检查是否是超时错误
+      if (error.name === 'AbortError') {
+        log("error", `[请求模拟] 请求超时:`, error.message);
+        log("error", '详细诊断:');
+        log("error", '- URL:', url);
+        log("error", '- 超时时间:', `${timeout}ms`);
+        log("error", `- 当前尝试: ${attempt + 1}/${maxRetries + 1}`);
+      } else {
+        log("error", `[请求模拟] 请求失败:`, error.message);
+        log("error", '详细诊断:');
+        log("error", '- URL:', url);
+        log("error", '- 错误类型:', error.name);
+        log("error", '- 消息:', error.message);
+        log("error", `- 当前尝试: ${attempt + 1}/${maxRetries + 1}`);
+        if (error.cause) {
+          log("error", '- 码:', error.cause.code);
+          log("error", '- 原因:', error.cause.message);
+        }
+      }
+
+      // 如果还有重试机会，继续循环；否则在循环结束后抛出错误
+      if (attempt < maxRetries) {
+        log("info", `[请求模拟] 准备重试...`);
+        continue;
+      }
+    }
+  }
+
+  // 所有重试都失败，抛出最后一个错误
+  log("error", `[请求模拟] 所有重试均失败 (${maxRetries + 1} 次尝试)`);
+  throw lastError;
+}
+
+export async function httpPost(url, body, options = {}) {
+  // 从 options 中获取重试次数，默认为 0
+  const maxRetries = parseInt(options.retries || '0', 10) || 0;
+  let lastError;
+
+  // 执行请求，包含重试逻辑
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      log("info", `[请求模拟] 第 ${attempt} 次重试: ${url}`);
+      // 可选：添加重试延迟（指数退避）
+      await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt - 1), 5000)));
+    } else {
+      log("info", `[请求模拟] HTTP POST: ${url}`);
+    }
+
+    // 设置超时时间（默认5秒）
+    const timeout = parseInt(options.timeout || globals.vodRequestTimeout || '5000', 10) || 5000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    // 链接外部中断信号
+    linkSignal(options.signal, controller);
+
+    // 处理请求头、body 和其他参数
+    const { headers = {}, params, allow_redirects = true } = options;
+    const fetchOptions = {
+      method: 'POST',
+      headers: {
+        ...headers,
+      },
+      body: body,
+      signal: controller.signal
+    };
+
+    if (!allow_redirects) {
+      fetchOptions.redirect = 'manual';  // 禁止重定向
+    }
+
+    try {
+      const response = await fetch(url, fetchOptions);
+
+      clearTimeout(timeoutId);
+
+      const data = await response.text();
+
+
+      if (!response.ok) {
+        log("error", `[请求模拟] response data: `, data);
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      let parsedData;
+      try {
+        parsedData = JSON.parse(data);  // 尝试将文本解析为 JSON
+      } catch (e) {
+        parsedData = data;  // 如果解析失败，保留原始文本
+      }
+
+      // 请求成功，返回结果
+      if (attempt > 0) {
+        log("info", `[请求模拟] 重试成功`);
+      }
+
+      // 模拟 iOS 环境：返回 { data: ... } 结构
+      return {
+        data: parsedData,
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries())
+      };
+
+    } catch (error) {
+      clearTimeout(timeoutId);
+      lastError = error;
+
+      // 如果是外部信号导致的中断，停止重试并直接抛出
+      if (options.signal?.aborted) {
+        throw error;
+      }
+
+      // 检查是否是超时错误
+      if (error.name === 'AbortError') {
+        log("error", `[请求模拟] 请求超时:`, error.message);
+        log("error", '详细诊断:');
+        log("error", '- URL:', url);
+        log("error", '- 超时时间:', `${timeout}ms`);
+        log("error", `- 当前尝试: ${attempt + 1}/${maxRetries + 1}`);
+      } else {
+        log("error", `[请求模拟] 请求失败:`, error.message);
+        log("error", '详细诊断:');
+        log("error", '- URL:', url);
+        log("error", '- 错误类型:', error.name);
+        log("error", '- 消息:', error.message);
+        log("error", `- 当前尝试: ${attempt + 1}/${maxRetries + 1}`);
+        if (error.cause) {
+          log("error", '- 码:', error.cause.code);
+          log("error", '- 原因:', error.cause.message);
+        }
+      }
+
+      // 如果还有重试机会，继续循环；否则在循环结束后抛出错误
+      if (attempt < maxRetries) {
+        log("info", `[请求模拟] 准备重试...`);
+        continue;
+      }
+    }
+  }
+
+  // 所有重试都失败，抛出最后一个错误
+  log("error", `[请求模拟] 所有重试均失败 (${maxRetries + 1} 次尝试)`);
+  throw lastError;
+}
+
+/**
+ * 通用 HTTP 请求函数（模拟环境返回结构）
+ * @param {string} method - HTTP 方法
+ * @param {string} url - 请求地址
+ * @param {any} [body] - 请求体（可选）
+ * @param {object} [options] - 选项
+ * @param {object} [options.headers] - 请求头
+ * @param {object} [options.params] - 查询参数（暂未实现）
+ * @param {boolean} [options.allow_redirects=true] - 是否允许重定向（暂未实现）
+ * @returns {Promise<{data: any, status: number, headers: Record<string, string>}>}
+ */
+async function httpRequestMethod(method, url, body, options = {}) {
+  log("info", `[请求模拟] HTTP ${method}: ${url}`);
+
   const { headers = {}, params, allow_redirects = true } = options;
+
   const fetchOptions = {
-    method: 'POST',
-    headers: {
-      ...headers,
-    },
-    body: body
+    method,
+    headers: { ...headers },
   };
 
-  if (!allow_redirects) {
-    fetchOptions.redirect = 'manual';  // 禁止重定向
+  // 只有在 body 存在时才设置（DELETE 通常无 body）
+  if (body !== undefined && body !== null) {
+    fetchOptions.body = body;
+  }
+
+  // 如果传递了 signal，直接透传给 fetch
+  if (options.signal) {
+    fetchOptions.signal = options.signal;
   }
 
   try {
     const response = await fetch(url, fetchOptions);
+    const textData = await response.text();
 
     if (!response.ok) {
+      log("error", `[请求模拟] response data: `, textData);
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
-    const data = await response.text();
     let parsedData;
     try {
-      parsedData = JSON.parse(data);  // 尝试将文本解析为 JSON
+      parsedData = JSON.parse(textData);
     } catch (e) {
-      parsedData = data;  // 如果解析失败，保留原始文本
+      parsedData = textData;
     }
 
-    // 模拟 iOS 环境：返回 { data: ... } 结构
     return {
       data: parsedData,
       status: response.status,
       headers: Object.fromEntries(response.headers.entries())
     };
-
   } catch (error) {
     log("error", `[请求模拟] 请求失败:`, error.message);
     log("error", '详细诊断:');
@@ -176,11 +355,23 @@ export async function httpPost(url, body, options = {}) {
     log("error", '- 错误类型:', error.name);
     log("error", '- 消息:', error.message);
     if (error.cause) {
-      log("error", '- 码:', error.cause.code);  // e.g., 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET'
-      log("error", '- 原因:', error.cause.message);
+      log("error", '- 码:', error.cause?.code);
+      log("error", '- 原因:', error.cause?.message);
     }
     throw error;
   }
+}
+
+export async function httpPatch(url, body, options = {}) {
+  return httpRequestMethod('PATCH', url, body, options);
+}
+
+export async function httpPut(url, body, options = {}) {
+  return httpRequestMethod('PUT', url, body, options);
+}
+
+export async function httpDelete(url, options = {}) {
+  return httpRequestMethod('DELETE', url, undefined, options); // DELETE 不传 body
 }
 
 export async function getPageTitle(url) {
@@ -223,7 +414,10 @@ export async function getPageTitle(url) {
 export function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { 
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*"
+    }
   });
 }
 
@@ -236,11 +430,15 @@ export function xmlResponse(data, status = 200) {
   // 直接返回 XML 字符串作为 Response 的 body
   return new Response(data, {
     status,
-    headers: { "Content-Type": "application/xml" },
+    headers: { 
+      "Content-Type": "application/xml",
+      "Access-Control-Allow-Origin": "*"
+    }
   });
 }
 
-export function buildQueryString(params) {
+export function buildQueryString(params, encode = true) {
+  const encodeFn = encode ? encodeURIComponent : (v) => v;
   let queryString = '';
 
   // 遍历 params 对象的每个属性
@@ -252,7 +450,7 @@ export function buildQueryString(params) {
       }
 
       // 将 key 和 value 使用 encodeURIComponent 编码，并拼接成查询字符串
-      queryString += encodeURIComponent(key) + '=' + encodeURIComponent(params[key]);
+      queryString += encodeFn(key) + '=' + encodeFn(params[key]);
     }
   }
 
@@ -350,4 +548,122 @@ export function getPathname(url) {
   let pathEnd = queryStart !== -1 ? queryStart : (hashStart !== -1 ? hashStart : url.length);
   const pathname = url.substring(pathStart, pathEnd);
   return pathname || '/';
+}
+
+/**
+ * 流式 GET 请求,支持前置数据缓冲嗅探与熔断
+ * @param {string} url 请求地址
+ * @param {object} options 配置项
+ * @param {number} [options.sniffLimit=32768] 最大嗅探长度(字节)，默认32KB
+ * @param {object} [options.headers] 请求头
+ * @param {function(string): boolean} checkCallback 数据检查回调,返回 false 则中断下载
+ * @returns {Promise<any>} 返回 JSON 数据或 null (被中断时)
+ */
+export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
+  const { headers = {}, sniffLimit } = options;
+  // 默认限制为 32KB
+  const SNIFF_LIMIT = parseInt(sniffLimit || '32768', 10) || 32768;
+  const timeout = parseInt(globals.vodRequestTimeout || '5000', 10) || 5000;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  // 链接外部中断信号
+  linkSignal(options.signal, controller);
+
+  try {
+    log("info", `[流式请求] HTTP GET: ${url}`);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: headers,
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const reader = response.body.getReader ? response.body.getReader() : null;
+
+    // 环境兼容性回退
+    if (!reader) {
+      log("warn", "[流式请求] 环境不支持流式读取,回退到普通请求");
+      const text = await response.text();
+      clearTimeout(timeoutId);
+      if (checkCallback && !checkCallback(text.slice(0, SNIFF_LIMIT))) {
+          log("info", "[流式请求] 检测到无效数据(回退模式),丢弃结果");
+          return null;
+      }
+      try { return JSON.parse(text); } catch { return text; }
+    }
+
+    let receivedLength = 0;
+    let chunks = [];
+    let isAborted = false;
+
+    // 缓冲状态
+    let checkBuffer = "";
+    let stopChecking = false; // 标记是否停止检查
+
+    // 流式读取循环
+    while(true) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+
+      // 先累加长度
+      receivedLength += value.length;
+
+      // 1. 数据嗅探逻辑 (仅在前 SNIFF_LIMIT 范围内执行)
+      if (!stopChecking && checkCallback) {
+        // 累积文本
+        const chunkText = new TextDecoder("utf-8").decode(value, {stream: true});
+        checkBuffer += chunkText;
+
+        // 执行回调检查
+        if (!checkCallback(checkBuffer)) {
+          log("info", `[流式请求] 嗅探到无效特征(已读${receivedLength}字节),立即熔断`);
+          controller.abort();
+          isAborted = true;
+          break;
+        }
+
+        // 如果缓冲区超过限制
+        if (receivedLength > SNIFF_LIMIT) {
+            stopChecking = true;
+            checkBuffer = null; // 释放缓冲区内存
+        }
+      }
+
+      chunks.push(value);
+    }
+
+    clearTimeout(timeoutId);
+
+    if (isAborted) return null; // 被中断,返回空
+
+    // 2. 拼接完整数据
+    let chunksAll = new Uint8Array(receivedLength);
+    let position = 0;
+    for(let chunk of chunks) {
+      chunksAll.set(chunk, position);
+      position += chunk.length;
+    }
+
+    const resultText = new TextDecoder("utf-8").decode(chunksAll);
+    try {
+      return JSON.parse(resultText);
+    } catch (e) {
+      return resultText;
+    }
+
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+       return null;
+    }
+    log("error", `[流式请求] 失败: ${error.message}`);
+    return null;
+  }
 }

@@ -1,31 +1,23 @@
 import BaseSource from './base.js';
 import { log } from "../utils/log-util.js";
-import { httpGet } from "../utils/http-util.js";
+import { getDoubanDetail, searchDoubanTitles } from "../utils/douban-util.js";
 
 // =====================
 // 获取豆瓣源播放链接
 // =====================
 export default class DoubanSource extends BaseSource {
-  constructor(tencentSource, iqiyiSource, youkuSource, bilibiliSource) {
+  constructor(tencentSource, iqiyiSource, youkuSource, bilibiliSource, miguSource) {
     super('BaseSource');
     this.tencentSource = tencentSource;
     this.iqiyiSource = iqiyiSource;
     this.youkuSource = youkuSource;
     this.bilibiliSource = bilibiliSource;
+    this.miguSource = miguSource;
   }
 
   async search(keyword) {
     try {
-      const response = await httpGet(
-        `https://m.douban.com/rexxar/api/v2/search?q=${keyword}&start=0&count=20&type=movie`,
-        {
-          headers: {
-            "Referer": "https://m.douban.com/movie/",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-          },
-        }
-      );
+      const response = await searchDoubanTitles(keyword);
 
       const data = response.data;
 
@@ -67,19 +59,11 @@ export default class DoubanSource extends BaseSource {
         if (anime?.layout !== "subject") return;
         const doubanId = anime.target_id;
         let animeType = anime?.type_name;
+        if (animeType !== "电影" && animeType !== "电视剧") return;
         log("info", "doubanId: ", doubanId, anime?.target?.title, animeType);
 
         // 获取平台详情页面url
-        const response = await httpGet(
-          `https://m.douban.com/rexxar/api/v2/movie/${doubanId}?for_mobile=1`,
-          {
-            headers: {
-              "Referer": `https://m.douban.com/movie/subject/${doubanId}/?dt_dapp=1`,
-              "Content-Type": "application/json",
-              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            },
-          }
-        );
+        const response = await getDoubanDetail(doubanId);
 
         const results = [];
 
@@ -129,7 +113,7 @@ export default class DoubanSource extends BaseSource {
               if (cid) {
                 tmpAnimes[0].provider = "tencent";
                 tmpAnimes[0].mediaId = cid;
-                await this.tencentSource.handleAnimes(tmpAnimes, queryTitle, doubanAnimes)
+                await this.tencentSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
               }
               break;
             }
@@ -138,7 +122,7 @@ export default class DoubanSource extends BaseSource {
               if (tvid) {
                 tmpAnimes[0].provider = "iqiyi";
                 tmpAnimes[0].mediaId = anime?.type_name === '电影' ? `movie_${tvid}` : tvid;
-                await this.iqiyiSource.handleAnimes(tmpAnimes, queryTitle, doubanAnimes)
+                await this.iqiyiSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
               }
               break;
             }
@@ -147,7 +131,7 @@ export default class DoubanSource extends BaseSource {
               if (showId) {
                 tmpAnimes[0].provider = "youku";
                 tmpAnimes[0].mediaId = showId;
-                await this.youkuSource.handleAnimes(tmpAnimes, queryTitle, doubanAnimes)
+                await this.youkuSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
               }
               break;
             }
@@ -156,7 +140,21 @@ export default class DoubanSource extends BaseSource {
               if (seasonId) {
                 tmpAnimes[0].provider = "bilibili";
                 tmpAnimes[0].mediaId = `ss${seasonId}`;
-                await this.bilibiliSource.handleAnimes(tmpAnimes, queryTitle, doubanAnimes)
+                await this.bilibiliSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
+              }
+              break;
+            }
+            case "miguvideo": {
+              let epId = null;
+              const decodeUrl = decodeURIComponent(vendor.uri);
+              const contentIdMatch = decodeUrl.match(/"contentID":"([^"]+)"/);
+              if (contentIdMatch && contentIdMatch[1]) {
+                epId = contentIdMatch[1];
+              }
+              if (epId) {
+                tmpAnimes[0].provider = "migu";
+                tmpAnimes[0].mediaId = `https://v3-sc.miguvideo.com/program/v4/cont/content-info/${epId}/1`;
+                await this.miguSource.handleAnimes(tmpAnimes, response.data?.title, doubanAnimes)
               }
               break;
             }
